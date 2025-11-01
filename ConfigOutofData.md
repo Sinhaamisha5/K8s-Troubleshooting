@@ -720,3 +720,722 @@ kubectl exec <new-pod> -- env | grep <VAR>
 # 7. Verify application working
 # (health checks, functionality tests, etc.)
 ```
+
+
+
+# Reloader: Automatic Pod Restart on ConfigMap/Secret Changes
+
+## The Problem Reloader Solves
+
+As we learned in the previous guide: ConfigMap and Secret changes don't automatically update pods. You must manually restart them.
+
+```
+OLD WORKFLOW (Without Reloader):
+1. Change ConfigMap
+2. Remember which deployments use it
+3. Manually restart each deployment
+4. Risk forgetting some deployments
+5. Production bugs occur weeks later
+
+NEW WORKFLOW (With Reloader):
+1. Change ConfigMap
+2. Reloader automatically detects change
+3. Reloader auto-restarts affected deployments
+4. No manual intervention needed
+5. Guaranteed all pods get new config
+```
+
+---
+
+## What is Reloader?
+
+Reloader is a Kubernetes controller that:
+- Watches ConfigMaps and Secrets
+- Detects when they change
+- Automatically performs rolling restart of affected Deployments, DaemonSets, and StatefulSets
+- Requires just one annotation on your workload
+
+**GitHub:** https://github.com/stakater/Reloader
+
+---
+
+## How Reloader Works
+
+### The Annotation
+
+Add one annotation to your Deployment/StatefulSet/DaemonSet:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  annotations:
+    reloader.stakater.com/match: "true"  # ← Add this
+spec:
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: app
+        image: my-app:1.0
+        env:
+        - name: CONFIG_MESSAGE
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: message
+```
+
+### How It Works Behind the Scenes
+
+```
+1. Reloader controller starts
+2. Reads all Deployments with annotation: reloader.stakater.com/match: "true"
+3. For each deployment, identifies all ConfigMaps and Secrets it uses
+4. Watches those ConfigMaps and Secrets for changes
+5. When change detected:
+   ├─ Perform rolling restart (kubectl rollout restart)
+   ├─ Delete old pods
+   ├─ Create new pods (which read new config)
+   └─ No downtime if replicas > 1
+```
+
+---
+
+## Installation
+
+### Option 1: Using Kubectl (Vanilla Manifests)
+
+```bash
+# Clone the Reloader repository
+git clone https://github.com/stakater/Reloader.git
+cd Reloader
+
+# Deploy using manifests
+kubectl apply -f deployments/kubernetes/
+
+# Verify deployment
+kubectl get deployment -n default reloader
+# Or check in kube-system namespace depending on manifests
+```
+
+### Option 2: Using Helm (Recommended)
+
+```bash
+# Add Helm repo
+helm repo add stakater https://stakater.github.io/stakater-helm-charts
+helm repo update
+
+# Install Reloader
+helm install reloader stakater/reloader \
+  --namespace default \
+  --create-namespace
+
+# Verify installation
+kubectl get deployment reloader
+kubectl get pods -l app.kubernetes.io/name=reloader
+```
+
+### Option 3: Using Helm with Custom Values
+
+```bash
+# Install with custom namespace and configuration
+helm install reloader stakater/reloader \
+  --namespace reloader-system \
+  --create-namespace \
+  --set reloader.deployment.env.logFormat=json \
+  --set reloader.deployment.replicas=2
+```
+
+### Verify Installation
+
+```bash
+# Check Reloader pod is running
+kubectl get pods --all-namespaces | grep reloader
+
+# Check logs
+kubectl logs -l app.kubernetes.io/name=reloader -n default
+
+# Should see log entries like:
+# "Watching ConfigMaps and Secrets for changes..."
+```
+
+---
+
+## Real Example: Using Reloader
+
+### Setup: Web App with ConfigMap
+
+**Step 1: Create ConfigMap**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-message
+  namespace: production
+data:
+  message: "hello world"
+```
+
+Apply it:
+```bash
+kubectl apply -f configmap.yaml
+```
+
+**Step 2: Create Deployment WITH Reloader Annotation**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: production
+  annotations:
+    reloader.stakater.com/match: "true"  # ← KEY: Enable Reloader
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+      - name: web
+        image: web-app:1.0
+        env:
+        - name: MESSAGE
+          valueFrom:
+            configMapKeyRef:
+              name: web-message
+              key: message
+        ports:
+        - containerPort: 3000
+```
+
+Apply it:
+```bash
+kubectl apply -f deployment.yaml
+```
+
+**Step 3: Verify Initial State**
+
+```bash
+# Check pod
+kubectl get pods -n production
+# NAME                      READY   STATUS    RESTARTS   AGE
+# web-app-abc123-abc12      1/1     Running   0          2m
+# web-app-abc123-def34      1/1     Running   0          2m
+
+# Check message
+curl localhost:3000
+# Response: "hello world"
+
+# Check environment variable inside pod
+kubectl exec -it web-app-abc123-abc12 -n production -- env | grep MESSAGE
+# MESSAGE=hello world
+```
+
+**Step 4: Edit ConfigMap (The Change)**
+
+```bash
+kubectl edit configmap web-message -n production
+```
+
+Change:
+```yaml
+# BEFORE
+data:
+  message: "hello world"
+
+# AFTER
+data:
+  message: "hello reloader"
+```
+
+**Step 5: Watch Reloader Do Its Magic**
+
+Watch pods in real-time:
+```bash
+kubectl get pods -n production --watch
+```
+
+Output:
+```
+NAME                      READY   STATUS        RESTARTS   AGE
+web-app-abc123-abc12      1/1     Running       0          5m
+web-app-abc123-def34      1/1     Running       0          5m
+
+# ConfigMap changed, Reloader detected it!
+# Rolling restart begins...
+
+web-app-abc123-abc12      1/1     Terminating   0          5m
+web-app-abc123-ghi56      0/1     Pending       0          1s
+
+web-app-abc123-def34      1/1     Terminating   0          5m
+web-app-abc123-ghi56      1/1     Running       0          5s
+web-app-abc123-jkl78      1/1     Running       0          3s
+
+# All old pods terminated, new ones running!
+```
+
+**Step 6: Verify New Config**
+
+```bash
+# Check message (should be updated!)
+curl localhost:3000
+# Response: "hello reloader"  ← UPDATED!
+
+# Check environment variable
+kubectl exec -it web-app-ghi56-n production -- env | grep MESSAGE
+# MESSAGE=hello reloader  ← UPDATED!
+```
+
+**No manual restart needed!** Reloader handled everything.
+
+---
+
+## Reloader Annotation Options
+
+### Option 1: Auto-Detect All ConfigMaps/Secrets (Simplest)
+
+```yaml
+annotations:
+  reloader.stakater.com/match: "true"
+```
+
+Effect: Restarts deployment when ANY ConfigMap or Secret it uses changes.
+
+### Option 2: Watch Specific ConfigMap Only
+
+```yaml
+annotations:
+  reloader.stakater.com/search: "true"
+  reloader.stakater.com/match: "configmap=web-message"
+```
+
+Effect: Only restarts if `web-message` ConfigMap changes. Ignores other ConfigMaps/Secrets.
+
+### Option 3: Watch Specific Secret Only
+
+```yaml
+annotations:
+  reloader.stakater.com/search: "true"
+  reloader.stakater.com/match: "secret=db-credentials"
+```
+
+Effect: Only restarts if `db-credentials` Secret changes.
+
+### Option 4: Watch Multiple Specific Resources
+
+```yaml
+annotations:
+  reloader.stakater.com/search: "true"
+  reloader.stakater.com/match: "configmap=web-message|secret=db-credentials"
+```
+
+Effect: Restarts if either resource changes.
+
+### Option 5: Exclude Certain Resources
+
+```yaml
+annotations:
+  reloader.stakater.com/match: "true"
+  reloader.stakater.com/ignore: "configmap=legacy-config|secret=old-secret"
+```
+
+Effect: Restart on any ConfigMap/Secret change EXCEPT the ones listed.
+
+---
+
+## Use Cases for Reloader
+
+### Use Case 1: Configuration Updates
+
+```yaml
+# Update feature flags, settings, etc.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+data:
+  enable_new_feature: "true"
+  
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    reloader.stakater.com/match: "true"
+spec:
+  template:
+    spec:
+      containers:
+      - env:
+        - name: FEATURE_FLAGS
+          valueFrom:
+            configMapKeyRef:
+              name: feature-flags
+              key: enable_new_feature
+```
+
+When feature flag updates: **Pods automatically restart with new flag**
+
+### Use Case 2: Secret Rotation
+
+```yaml
+# Rotate API keys, passwords, tokens
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-keys
+type: Opaque
+data:
+  api_key: YWJjZGVmZ2hpams=
+  
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    reloader.stakater.com/match: "true"
+spec:
+  template:
+    spec:
+      containers:
+      - env:
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: api-keys
+              key: api_key
+```
+
+When secret updates: **Pods automatically restart with new key**
+
+### Use Case 3: Certificate Updates
+
+```yaml
+# Update TLS certificates
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-cert
+type: kubernetes.io/tls
+data:
+  tls.crt: LS0tLS1CRUdJTi...
+  tls.key: LS0tLS1CRUdJTi...
+  
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    reloader.stakater.com/match: "true"
+spec:
+  template:
+    spec:
+      volumes:
+      - name: certs
+        secret:
+          secretName: tls-cert
+```
+
+When certificate updates: **Pods automatically restart with new cert**
+
+---
+
+## Comparison: Before and After Reloader
+
+### Without Reloader
+
+```bash
+# Step 1: Update ConfigMap
+kubectl edit configmap app-config
+
+# Step 2: Oh no, which deployments use this?
+# Let me search...
+grep -r "app-config" k8s-manifests/
+# Found: payment-api, notification-service, reporting-engine
+
+# Step 3: Manually restart each one
+kubectl rollout restart deployment payment-api
+kubectl rollout restart deployment notification-service
+kubectl rollout restart deployment reporting-engine
+
+# Step 4: What if I missed one?
+# Let me check:
+grep -r "app-config" k8s-manifests/ | grep -v payment-api | grep -v notification | grep -v reporting
+# Oh no! legacy-system also uses it!
+
+kubectl rollout restart deployment legacy-system
+
+# Step 5: Verify each one
+kubectl get deployments
+# Check status of each restart...
+
+# Time spent: 15-30 minutes
+# Risk: Human error, forgot deployments, mistakes
+```
+
+### With Reloader
+
+```bash
+# Step 1: Update ConfigMap
+kubectl edit configmap app-config
+
+# That's it! Reloader does everything else automatically.
+# Time spent: < 1 minute
+# Risk: Zero (automatic)
+```
+
+---
+
+## Best Practices with Reloader
+
+### 1. Use Match: "true" for Generic Deployments
+
+```yaml
+annotations:
+  reloader.stakater.com/match: "true"
+```
+
+Safest option: Auto-discovers all ConfigMaps and Secrets.
+
+### 2. Be Specific for Critical Deployments
+
+```yaml
+annotations:
+  reloader.stakater.com/match: "true"
+  reloader.stakater.com/ignore: "configmap=debug-config"
+```
+
+For production deployments, ignore debug/non-critical configs.
+
+### 3. Use on All Workload Types
+
+```yaml
+# Deployments
+annotations:
+  reloader.stakater.com/match: "true"
+
+# StatefulSets
+annotations:
+  reloader.stakater.com/match: "true"
+
+# DaemonSets
+annotations:
+  reloader.stakater.com/match: "true"
+```
+
+Reloader works on all resource types.
+
+### 4. Don't Mix Environment Variables and Volumes
+
+Best practice: If using Reloader, stick to ONE method:
+
+```yaml
+# GOOD: Only environment variables + Reloader
+env:
+- name: CONFIG
+  valueFrom:
+    configMapKeyRef:
+      name: my-config
+      key: data
+
+# GOOD: Only mounted volumes (auto-update, no restart needed)
+volumeMounts:
+- name: config
+  mountPath: /etc/config
+
+# AVOID: Mixing both (confusing!)
+```
+
+### 5. Monitor Reloader Logs
+
+```bash
+# Check if Reloader is working
+kubectl logs -f -l app.kubernetes.io/name=reloader
+
+# Look for messages like:
+# "Restarting deployment/payment-api due to ConfigMap change"
+# "Detected change in secret/db-credentials"
+```
+
+---
+
+## Troubleshooting Reloader
+
+### Issue 1: Reloader Installed But Pods Not Restarting
+
+**Check 1: Annotation Present?**
+```bash
+kubectl get deployment myapp -o yaml | grep reloader
+# Should show: reloader.stakater.com/match: "true"
+```
+
+**Check 2: Reloader Pod Running?**
+```bash
+kubectl get pods -l app.kubernetes.io/name=reloader
+# Should show: Running status
+```
+
+**Check 3: Reloader Has RBAC Permissions?**
+```bash
+kubectl get clusterrole reloader
+kubectl get clusterrolebinding reloader
+# Should exist
+```
+
+### Issue 2: Reloader Doesn't Detect ConfigMap Changes
+
+**Check 1: ConfigMap in Same Namespace?**
+```bash
+# ConfigMap and Deployment must be in same namespace
+kubectl get configmap -n production
+kubectl get deployment -n production
+```
+
+**Check 2: ConfigMap Referenced Correctly?**
+```bash
+kubectl get deployment myapp -o yaml | grep configMapKeyRef -A 3
+# Verify name matches actual ConfigMap name
+```
+
+**Check 3: Reloader Logs**
+```bash
+kubectl logs -l app.kubernetes.io/name=reloader --tail=50
+# Look for errors or "watching" messages
+```
+
+---
+
+## Real-World Scenario: Secret Rotation
+
+```bash
+# Scenario: Database password rotation every 90 days
+
+# Current state: Old password in Secret
+kubectl get secret db-credentials -o yaml
+# Shows: old_password_hash
+
+# Pods using it are running fine
+kubectl get pods | grep myapp
+# 3 pods running, connected to database
+
+# Step 1: Update the Secret with new password
+kubectl edit secret db-credentials
+
+# Change password value
+
+# Step 2: Reloader automatically detects change
+# Reloader performs rolling restart:
+# - Pod 1 terminates
+# - New Pod 1 starts (reads new password)
+# - Pod 2 terminates
+# - New Pod 2 starts (reads new password)
+# - Pod 3 terminates
+# - New Pod 3 starts (reads new password)
+
+# Step 3: Verify all pods connected to database
+kubectl get pods | grep myapp
+# All 3 pods show: READY 1/1 (meaning readiness probe passed)
+
+# Step 4: Verify database connection works
+kubectl logs <pod> | grep "Connected to database"
+
+# Done! Password rotated, all pods updated, zero downtime!
+```
+
+---
+
+## Reloader vs Manual Restart
+
+| Aspect | Manual Restart | Reloader |
+|--------|----------------|----------|
+| **Detection** | Manual checking | Automatic |
+| **Restart triggering** | Manual command | Automatic |
+| **Time to restart** | 5-30 minutes | < 1 minute |
+| **Risk of forgetting** | High (human error) | Zero (automatic) |
+| **Scaling** | Harder with 100+ deployments | Same effort always |
+| **Maintenance** | Required | None |
+| **Automation** | Manual | Fully automated |
+
+---
+
+## Interview Story: Reloader Saves the Day
+
+**Problem in Production:**
+"We had a critical incident where a database password expired. The operations team updated the Secret with the new password, but forgot to restart the deployments using it. For hours, the deployments couldn't connect to the database, causing customer-facing issues."
+
+**The Lesson:**
+"After that incident, we implemented Reloader across the entire cluster. Now whenever a Secret or ConfigMap is updated, Reloader automatically restarts the affected deployments. We don't have to remember which deployments use which configs."
+
+**Implementation:**
+"We added a simple annotation to all our deployments: `reloader.stakater.com/match: "true"`. For critical deployments, we use specific annotations to only watch certain ConfigMaps/Secrets. This ensures deployments get new configuration immediately without manual intervention."
+
+**The Impact:**
+"It's been a lifesaver. Feature flag updates roll out instantly. Secret rotations happen automatically. Configuration changes are applied within seconds. No more manual tracking of which deployment uses which config. And no more human errors causing incidents."
+
+---
+
+## Key Takeaways
+
+1. **Reloader solves the immutability problem** → Automatic restart on config changes
+
+2. **Simple annotation enables it** → `reloader.stakater.com/match: "true"`
+
+3. **No manual tracking needed** → Reloader discovers all ConfigMaps/Secrets automatically
+
+4. **Works with all workload types** → Deployments, StatefulSets, DaemonSets
+
+5. **Flexible options available** → Match specific resources or ignore certain ones
+
+6. **Rolling restart preserves availability** → No downtime if replicas > 1
+
+7. **Highly recommended for production** → Saves time and prevents human error
+
+8. **Easy to install** → Kubectl manifests or Helm
+
+9. **Scales with infrastructure** → Same effort for 5 deployments or 500
+
+10. **Best used with annotations** → Simple, effective, maintainable
+
+---
+
+## Next Steps
+
+1. **Install Reloader in your cluster**
+   ```bash
+   helm install reloader stakater/reloader -n reloader-system --create-namespace
+   ```
+
+2. **Add annotation to critical deployments**
+   ```yaml
+   annotations:
+     reloader.stakater.com/match: "true"
+   ```
+
+3. **Test it**
+   - Edit a ConfigMap
+   - Watch pods automatically restart
+   - Verify new configuration
+
+4. **Roll out to all deployments**
+   - Add annotation to all production workloads
+   - Remove all manual restart procedures
+   - Focus on application development, not operations
+
+---
+
+## Conclusion
+
+Reloader transforms ConfigMap/Secret updates from a manual, error-prone process into an automated, reliable one. Combined with the knowledge of immutability from the previous guide, Reloader gives you the best of both worlds: Kubernetes's immutability principle AND automatic configuration propagation.
+
+This is why I use Reloader in most, if not all, of my production deployments. It's a lifesaver.
