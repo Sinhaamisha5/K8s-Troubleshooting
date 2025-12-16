@@ -33,8 +33,38 @@ OLD: ENV VAR = old value (read when pod started)
 CHANGE: ConfigMap updated
 KUBERNETES DOESN'T: Update environment variable in running pod
 INSTEAD: Pod must restart to read new ConfigMap
-```
 
+🔹 Which Kubernetes resource continuously watches for changes?
+✅ Controllers (Control Plane components)
+
+Kubernetes controllers continuously watch the API Server for state changes.
+
+Examples:
+Deployment Controller
+ReplicaSet Controller
+StatefulSet Controller
+DaemonSet Controller
+Node Controller
+HPA Controller
+
+👉 Controllers use a watch mechanism to:
+
+Observe desired state vs actual state
+
+Take corrective action automatically
+
+📌 Pods themselves do NOT watch for changes — they are passive.
+```
+```
+Definition
+A ConfigMap is a Kubernetes object used to store non-sensitive configuration data in key-value format.
+Why ConfigMap Is Used
+
+  Externalizes configuration from application code
+  Avoids rebuilding container images for config changes
+  Enables environment-specific configs (dev, qa, prod)
+  Improves portability and maintainability
+```
 ### Critical Understanding
 
 ```
